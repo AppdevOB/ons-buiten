@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#2d6a2d">
+<link rel="manifest" href="manifest.json">
+<title>Ons Buiten – Bezorgroute</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: system-ui, sans-serif;
+    background: #f5f0e8;
+    color: #1a1a1a;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    background: #2d6a2d;
+    color: white;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  header h1 { font-size: 1.1rem; font-weight: 600; }
+  header span { font-size: 1.4rem; }
+
+  #invoer {
+    padding: 16px;
+    background: white;
+    border-bottom: 1px solid #ddd;
+  }
+
+  #invoer label {
+    display: block;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #555;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  #invoer-rij {
+    display: flex;
+    gap: 8px;
+  }
+
+  #tuinnummers {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1.5px solid #ccc;
+    border-radius: 8px;
+    font-size: 1rem;
+    background: #fafafa;
+  }
+  #tuinnummers:focus {
+    outline: none;
+    border-color: #2d6a2d;
+  }
+
+  #bereken-btn {
+    background: #2d6a2d;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #bereken-btn:active { background: #245824; }
+  #bereken-btn:disabled { background: #888; cursor: wait; }
+
+  #status {
+    padding: 8px 16px;
+    font-size: 0.85rem;
+    color: #555;
+    min-height: 28px;
+  }
+  #status.fout { color: #c0392b; }
+  #status.ok { color: #2d6a2d; }
+
+  #route-info {
+    padding: 0 16px 12px;
+    display: none;
+  }
+
+  #stops-lijst {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .stop-badge {
+    background: #2d6a2d;
+    color: white;
+    border-radius: 20px;
+    padding: 4px 10px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .stop-badge.depot { background: #1a3d1a; }
+
+  #kaart-wrapper {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    background: #e8e0d0;
+    touch-action: none;
+  }
+
+  #kaart-container {
+    position: absolute;
+    transform-origin: 0 0;
+    cursor: grab;
+  }
+  #kaart-container:active { cursor: grabbing; }
+
+  #kaart-img {
+    display: block;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  #route-canvas {
+    position: absolute;
+    top: 0; left: 0;
+    pointer-events: none;
+  }
+
+  #laden {
+    position: fixed;
+    inset: 0;
+    background: #2d6a2d;
+    color: white;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    z-index: 100;
+  }
+  #laden h2 { font-size: 1.3rem; }
+  #laden p { font-size: 0.9rem; opacity: 0.8; }
+  .spinner {
+    width: 40px; height: 40px;
+    border: 4px solid rgba(255,255,255,0.3);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="laden">
+  <div class="spinner"></div>
+  <h2>Ons Buiten</h2>
+  <p>Kaart laden…</p>
+</div>
+
+<header>
+  <span>🌱</span>
+  <h1>Bezorgroute Ons Buiten</h1>
+</header>
+
+<div id="invoer">
+  <label for="tuinnummers">Tuinnummers (gescheiden door spatie of komma)</label>
+  <div id="invoer-rij">
+    <input type="text" id="tuinnummers" placeholder="bv. 37 156 203 kas werf" autocomplete="off" autocorrect="off" autocapitalize="off">
+    <button id="bereken-btn" onclick="berekenRoute()">Berekenen</button>
+  </div>
+</div>
+
+<div id="status">Voer tuinnummers in en druk op Berekenen.</div>
+
+<div id="route-info">
+  <div id="stops-lijst"></div>
+</div>
+
+<div id="kaart-wrapper">
+  <div id="kaart-container">
+    <img id="kaart-img" src="kaart.png" draggable="false">
+    <canvas id="route-canvas"></canvas>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let routeData = null;
+let graph = null;      // Map: "x,y" -> [{node:"x,y", w:float}]
+let schaal = 1;
+let panX = 0, panY = 0;
+let isPanning = false, lastPan = null;
+let initPinchDist = null, initSchaal = 1;
+
+// ── Data laden ─────────────────────────────────────────────────────────────
+async function laadData() {
+  const resp = await fetch('routedata.json');
+  routeData = await resp.json();
+  buildGraph();
+  document.getElementById('laden').style.display = 'none';
+  initKaart();
+}
+
+function buildGraph() {
+  graph = new Map();
+  for (const [x1,y1,x2,y2,w] of routeData.edges) {
+    const a = `${x1},${y1}`, b = `${x2},${y2}`;
+    if (!graph.has(a)) graph.set(a, []);
+    if (!graph.has(b)) graph.set(b, []);
+    graph.get(a).push({node: b, w});
+    graph.get(b).push({node: a, w});
+  }
+}
+
+// ── Dijkstra ───────────────────────────────────────────────────────────────
+function nearestNode(cx, cy) {
+  // Vind de dichtstbijzijnde skeleton node voor een entry point
+  let best = null, bestD = Infinity;
+  for (const key of graph.keys()) {
+    const [x, y] = key.split(',').map(Number);
+    const d = (x-cx)**2 + (y-cy)**2;
+    if (d < bestD) { bestD = d; best = key; }
+  }
+  return best;
+}
+
+function dijkstra(startKey, endKey) {
+  const dist = new Map();
+  const prev = new Map();
+  const visited = new Set();
+  // Min-heap via array + sort (voldoende voor deze grafgrootte)
+  const queue = [[0, startKey]];
+  dist.set(startKey, 0);
+
+  while (queue.length) {
+    queue.sort((a,b) => a[0]-b[0]);
+    const [d, u] = queue.shift();
+    if (visited.has(u)) continue;
+    visited.add(u);
+    if (u === endKey) break;
+    for (const {node: v, w} of (graph.get(u) || [])) {
+      const nd = d + w;
+      if (!dist.has(v) || nd < dist.get(v)) {
+        dist.set(v, nd);
+        prev.set(v, u);
+        queue.push([nd, v]);
+      }
+    }
+  }
+
+  // Pad reconstrueren
+  const path = [];
+  let cur = endKey;
+  while (cur) { path.unshift(cur); cur = prev.get(cur); }
+  return path[0] === startKey ? path : null;
+}
+
+// ── Invoer verwerken ───────────────────────────────────────────────────────
+function resolveStop(input) {
+  const s = input.trim().toLowerCase();
+  const aliases = routeData.aliases;
+  const ep = routeData.entry_points;
+  if (aliases[s]) return aliases[s];
+  // Exact match
+  if (ep[s]) return s;
+  if (ep[input.trim()]) return input.trim();
+  return null;
+}
+
+function berekenRoute() {
+  if (!routeData) return;
+  const invoer = document.getElementById('tuinnummers').value;
+  const delen = invoer.split(/[\s,]+/).filter(Boolean);
+  if (!delen.length) { setStatus('Voer minimaal één tuinnummer in.', 'fout'); return; }
+
+  const stops = [];
+  const onbekend = [];
+  for (const d of delen) {
+    const id = resolveStop(d);
+    if (id) stops.push(id);
+    else onbekend.push(d);
+  }
+
+  if (onbekend.length) {
+    setStatus(`Onbekend: ${onbekend.join(', ')}`, 'fout');
+    return;
+  }
+
+  const btn = document.getElementById('bereken-btn');
+  btn.disabled = true;
+  setStatus('Route berekenen…');
+
+  // Kleine vertraging zodat UI update zichtbaar is
+  setTimeout(() => {
+    try {
+      tekenRoute(stops);
+    } catch(e) {
+      setStatus('Fout bij berekenen: ' + e.message, 'fout');
+    }
+    btn.disabled = false;
+  }, 50);
+}
+
+function tekenRoute(stops) {
+  const ep = routeData.entry_points;
+  const volgorde = ['depot', ...stops, 'depot'];
+  const allePixels = [];
+
+  for (let i = 0; i < volgorde.length - 1; i++) {
+    const a = volgorde[i], b = volgorde[i+1];
+    const [ax, ay] = ep[a];
+    const [bx, by] = ep[b];
+    const na = nearestNode(ax, ay);
+    const nb = nearestNode(bx, by);
+    const pad = dijkstra(na, nb);
+    if (!pad) { setStatus(`Geen pad van ${a} naar ${b}.`, 'fout'); return; }
+    allePixels.push(...(allePixels.length ? pad.slice(1) : pad));
+  }
+
+  tekenCanvas(allePixels, volgorde, stops);
+
+  const totaal = Math.round(allePixels.length * 0.1); // ruwe afstandsindicatie
+  setStatus(`Route berekend — ${stops.length} stop${stops.length !== 1 ? 's' : ''}.`, 'ok');
+  toonStops(volgorde);
+}
+
+// ── Canvas tekenen ─────────────────────────────────────────────────────────
+function tekenCanvas(pixels, volgorde, stops) {
+  const img = document.getElementById('kaart-img');
+  const canvas = document.getElementById('route-canvas');
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!pixels.length) return;
+
+  // Lijn
+  ctx.beginPath();
+  const [sx, sy] = pixels[0].split(',').map(Number);
+  ctx.moveTo(sx, sy);
+  for (let i = 1; i < pixels.length; i++) {
+    const [x, y] = pixels[i].split(',').map(Number);
+    ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = 'rgba(0, 100, 220, 0.85)';
+  ctx.lineWidth = 12;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // Stops markeren
+  const ep = routeData.entry_points;
+  volgorde.forEach((stop, i) => {
+    if (i === 0 || i === volgorde.length - 1) return; // depot apart
+    const [x, y] = ep[stop];
+    ctx.beginPath();
+    ctx.arc(x, y, 20, 0, Math.PI * 2);
+    ctx.fillStyle = 'white';
+    ctx.fill();
+    ctx.strokeStyle = '#0064dc';
+    ctx.lineWidth = 5;
+    ctx.stroke();
+    ctx.fillStyle = '#0064dc';
+    ctx.font = 'bold 22px system-ui';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(i, x, y);
+  });
+
+  // Depot
+  const [dx, dy] = ep['depot'];
+  ctx.beginPath();
+  ctx.arc(dx, dy, 22, 0, Math.PI * 2);
+  ctx.fillStyle = '#1a3d1a';
+  ctx.fill();
+  ctx.fillStyle = 'white';
+  ctx.font = 'bold 16px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('S', dx, dy);
+}
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+function setStatus(msg, cls = '') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = cls;
+}
+
+function toonStops(volgorde) {
+  const info = document.getElementById('route-info');
+  const lijst = document.getElementById('stops-lijst');
+  lijst.innerHTML = '';
+  volgorde.forEach((stop, i) => {
+    const badge = document.createElement('span');
+    badge.className = 'stop-badge' + (stop === 'depot' ? ' depot' : '');
+    badge.textContent = i === 0 ? '🏁 Start' : i === volgorde.length - 1 ? '🏁 Einde' : `${i}. ${stop}`;
+    lijst.appendChild(badge);
+  });
+  info.style.display = 'block';
+}
+
+// ── Kaart pan & zoom ───────────────────────────────────────────────────────
+function initKaart() {
+  const wrapper = document.getElementById('kaart-wrapper');
+  const container = document.getElementById('kaart-container');
+  const img = document.getElementById('kaart-img');
+
+  img.onload = () => {
+    // Initieel: kaart past in breedte
+    schaal = wrapper.clientWidth / img.naturalWidth;
+    panX = 0; panY = 0;
+    updateTransform();
+  };
+  if (img.complete) img.onload();
+
+  // Touch events
+  wrapper.addEventListener('touchstart', e => {
+    if (e.touches.length === 2) {
+      initPinchDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      initSchaal = schaal;
+    } else if (e.touches.length === 1) {
+      isPanning = true;
+      lastPan = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+  }, { passive: true });
+
+  wrapper.addEventListener('touchmove', e => {
+    if (e.touches.length === 2 && initPinchDist) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      schaal = Math.min(4, Math.max(0.2, initSchaal * dist / initPinchDist));
+      updateTransform();
+    } else if (e.touches.length === 1 && isPanning && lastPan) {
+      panX += e.touches[0].clientX - lastPan.x;
+      panY += e.touches[0].clientY - lastPan.y;
+      lastPan = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      updateTransform();
+    }
+  }, { passive: true });
+
+  wrapper.addEventListener('touchend', () => {
+    isPanning = false; lastPan = null; initPinchDist = null;
+  });
+
+  // Mouse events
+  wrapper.addEventListener('mousedown', e => {
+    isPanning = true;
+    lastPan = { x: e.clientX, y: e.clientY };
+  });
+  wrapper.addEventListener('mousemove', e => {
+    if (!isPanning || !lastPan) return;
+    panX += e.clientX - lastPan.x;
+    panY += e.clientY - lastPan.y;
+    lastPan = { x: e.clientX, y: e.clientY };
+    updateTransform();
+  });
+  wrapper.addEventListener('mouseup', () => { isPanning = false; });
+  wrapper.addEventListener('mouseleave', () => { isPanning = false; });
+
+  wrapper.addEventListener('wheel', e => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    schaal = Math.min(4, Math.max(0.2, schaal * factor));
+    updateTransform();
+  }, { passive: false });
+}
+
+function updateTransform() {
+  const container = document.getElementById('kaart-container');
+  const canvas = document.getElementById('route-canvas');
+  const img = document.getElementById('kaart-img');
+  container.style.transform = `translate(${panX}px, ${panY}px) scale(${schaal})`;
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  canvas.style.width = img.naturalWidth + 'px';
+  canvas.style.height = img.naturalHeight + 'px';
+}
+
+// Enter key
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('tuinnummers').addEventListener('keydown', e => {
+    if (e.key === 'Enter') berekenRoute();
+  });
+  laadData();
+});
+
+// Service worker
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js');
+}
+</script>
+</body>
+</html>
