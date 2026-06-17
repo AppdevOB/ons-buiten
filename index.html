@@ -77,7 +77,6 @@
 <script>
 let routeData = null;
 let graph = null;
-let penaltyMap = null;
 let schaal = 1;
 let panX = 0, panY = 0;
 let isPanning = false, lastPan = null;
@@ -89,7 +88,6 @@ async function laadData() {
   const resp = await fetch('routedata.json');
   routeData = await resp.json();
   buildGraph();
-  buildPenaltyMap();
   document.getElementById('laden').style.display = 'none';
   initKaart();
 }
@@ -105,57 +103,6 @@ function buildGraph() {
   }
 }
 
-function buildPenaltyMap() {
-  // penaltyMap: kruispuntNode -> [{vanKant, naarKant, penalty}]
-  penaltyMap = new Map();
-  const kp = routeData.kruispunten;
-  const PENALTY = routeData.turn_penalty;
-
-  // Correcte richtingen (bewegingsrichting, niet herkomstrichting):
-  // Berthalaan/LvB:
-  //   Uit Berthalaan (west->oost aankomst) linksaf naar noord: oost->noord VERBODEN
-  //   Vanuit noorden (noord->zuid aankomst) rechtsaf Berthalaan in (west): zuid->west VERBODEN
-  // Zijlanen/Zuidsingel (Elizabeth, Wilhelmina, Bertha):
-  //   Uit zijlaan (oost->west aankomst) linksaf richting tuin 1 (zuiden): west->zuid VERBODEN
-  //   Vanuit zuiden (zuid->noord aankomst) rechtsaf zijlaan in (west): noord->west VERBODEN
-
-  const verboden = [
-    ['B_LvB', 'oost', 'noord'],
-    ['B_LvB', 'zuid', 'west'],
-    ['B_ZS',  'west', 'zuid'],
-    ['B_ZS',  'noord', 'west'],
-    ['W_ZS',  'west', 'zuid'],
-    ['W_ZS',  'noord', 'west'],
-    ['E_ZS',  'west', 'zuid'],
-    ['E_ZS',  'noord', 'west'],
-  ];
-
-  for (const [kpKey, vanKant, naarKant] of verboden) {
-    const [kx, ky] = kp[kpKey];
-    const node = `${kx}|${ky}`;
-    if (!penaltyMap.has(node)) penaltyMap.set(node, []);
-    penaltyMap.get(node).push({vanKant, naarKant, penalty: PENALTY});
-  }
-}
-
-function getKant(fromNode, toNode) {
-  const [fx, fy] = fromNode.split('|').map(Number);
-  const [tx, ty] = toNode.split('|').map(Number);
-  const dx = tx - fx, dy = ty - fy;
-  if (Math.abs(dx) >= Math.abs(dy)) return dx > 0 ? 'oost' : 'west';
-  return dy > 0 ? 'zuid' : 'noord';
-}
-
-function getTurnPenalty(prevNode, curNode, nextNode) {
-  if (!prevNode || !penaltyMap.has(curNode)) return 0;
-  const vanKant = getKant(prevNode, curNode);
-  const naarKant = getKant(curNode, nextNode);
-  for (const {vanKant: vk, naarKant: nk, penalty} of penaltyMap.get(curNode)) {
-    if (vk === vanKant && nk === naarKant) return penalty;
-  }
-  return 0;
-}
-
 function nearestNode(cx, cy) {
   let best = null, bestD = Infinity;
   for (const key of graph.keys()) {
@@ -167,67 +114,80 @@ function nearestNode(cx, cy) {
 }
 
 function dijkstra(startKey, endKey) {
-  // State: {node, prev} — slaan op als object, index als integer voor snelheid
-  const stateKey = (node, prev) => `${prev}=>${node}`;
   const dist = new Map();
-  const cameFrom = new Map();
-  const queue = [[0, startKey, null]]; // [cost, node, prevNode]
-  dist.set(stateKey(startKey, null), 0);
+  const prev = new Map();
+  const visited = new Set();
+  const queue = [[0, startKey]];
+  dist.set(startKey, 0);
 
   while (queue.length) {
     queue.sort((a,b) => a[0]-b[0]);
-    const [d, u, p] = queue.shift();
-    const sk = stateKey(u, p);
-    if (cameFrom.has(sk) && cameFrom.get(sk) !== undefined && dist.get(sk) < d) continue;
-
-    if (u === endKey) {
-      // Reconstruct
-      const path = [];
-      let cur = sk;
-      while (cur) {
-        const node = cur.split('=>')[1];
-        path.unshift(node);
-        cur = cameFrom.get(cur);
-      }
-      return path;
-    }
-
+    const [d, u] = queue.shift();
+    if (visited.has(u)) continue;
+    visited.add(u);
+    if (u === endKey) break;
     for (const {node: v, w} of (graph.get(u) || [])) {
-      const tp = getTurnPenalty(p, u, v);
-      const nd = d + w + tp;
-      const nsk = stateKey(v, u);
-      if (!dist.has(nsk) || nd < dist.get(nsk)) {
-        dist.set(nsk, nd);
-        cameFrom.set(nsk, sk);
-        queue.push([nd, v, u]);
+      const nd = d + w;
+      if (!dist.has(v) || nd < dist.get(v)) {
+        dist.set(v, nd);
+        prev.set(v, u);
+        queue.push([nd, v]);
       }
     }
   }
-  return null;
+  const path = [];
+  let cur = endKey;
+  while (cur) { path.unshift(cur); cur = prev.get(cur); }
+  return path[0] === startKey ? path : null;
 }
 
-function routeAfstand(volgorde) {
-  const ep = routeData.entry_points;
-  const seq = ['depot', ...volgorde, 'depot'];
-  let totaal = 0;
-  for (let i = 0; i < seq.length - 1; i++) {
-    const [ax, ay] = ep[seq[i]];
-    const [bx, by] = ep[seq[i+1]];
-    totaal += Math.sqrt((ax-bx)**2 + (ay-by)**2);
+// Bereken afstanden tussen alle stops via Dijkstra (voor optimalisatie)
+function berekenAfstandMatrix(nodes) {
+  const matrix = {};
+  for (let i = 0; i < nodes.length; i++) {
+    matrix[nodes[i]] = {};
+    const dist = new Map();
+    const visited = new Set();
+    const queue = [[0, nodes[i]]];
+    dist.set(nodes[i], 0);
+    while (queue.length) {
+      queue.sort((a,b) => a[0]-b[0]);
+      const [d, u] = queue.shift();
+      if (visited.has(u)) continue;
+      visited.add(u);
+      for (const {node: v, w} of (graph.get(u) || [])) {
+        const nd = d + w;
+        if (!dist.has(v) || nd < dist.get(v)) {
+          dist.set(v, nd);
+          queue.push([nd, v]);
+        }
+      }
+    }
+    for (let j = 0; j < nodes.length; j++) {
+      matrix[nodes[i]][nodes[j]] = dist.get(nodes[j]) || Infinity;
+    }
   }
-  return totaal;
+  return matrix;
 }
 
-function optimaliseerVolgorde(stops) {
+function optimaliseerVolgorde(stops, stopNodes) {
+  const depotNode = nearestNode(...routeData.entry_points['depot']);
+  const allNodes = [depotNode, ...stops.map(s => stopNodes[s])];
+  
   if (stops.length <= 7) {
+    // Brute force met echte afstanden
+    const matrix = berekenAfstandMatrix(allNodes);
     const perms = permutaties(stops);
-    let beste = stops, besteD = routeAfstand(stops);
+    let beste = stops, besteD = Infinity;
     for (const p of perms) {
-      const d = routeAfstand(p);
+      let d = matrix[depotNode][stopNodes[p[0]]];
+      for (let i = 0; i < p.length - 1; i++) d += matrix[stopNodes[p[i]]][stopNodes[p[i+1]]];
+      d += matrix[stopNodes[p[p.length-1]]][depotNode];
       if (d < besteD) { besteD = d; beste = p; }
     }
     return beste;
   } else {
+    // Nearest neighbour
     const ep = routeData.entry_points;
     const overig = [...stops];
     const volgorde = [];
@@ -278,17 +238,22 @@ function berekenRoute() {
     if (id) stops.push(id);
     else onbekend.push(d);
   }
-
   if (onbekend.length) { setStatus(`Onbekend: ${onbekend.join(', ')}`, 'fout'); return; }
 
   const btn = document.getElementById('bereken-btn');
   btn.disabled = true;
-  setStatus('Route optimaliseren…');
+  setStatus('Route berekenen…');
 
   setTimeout(() => {
     try {
-      const geoptimaliseerd = optimaliseerVolgorde(stops);
-      tekenRoute(geoptimaliseerd);
+      // Bepaal skeleton nodes voor alle stops
+      const stopNodes = {};
+      for (const s of stops) {
+        const [cx, cy] = routeData.entry_points[s];
+        stopNodes[s] = nearestNode(cx, cy);
+      }
+      const geoptimaliseerd = optimaliseerVolgorde(stops, stopNodes);
+      tekenRoute(geoptimaliseerd, stopNodes);
     } catch(e) {
       setStatus('Fout: ' + e.message, 'fout');
       console.error(e);
@@ -297,26 +262,29 @@ function berekenRoute() {
   }, 50);
 }
 
-function tekenRoute(stops) {
+function tekenRoute(stops, stopNodes) {
   const ep = routeData.entry_points;
   const volgorde = ['depot', ...stops, 'depot'];
   const allePixels = [];
 
-  for (let i = 0; i < volgorde.length - 1; i++) {
-    const a = volgorde[i], b = volgorde[i+1];
-    const [ax, ay] = ep[a];
-    const [bx, by] = ep[b];
-    const na = nearestNode(ax, ay);
-    const nb = nearestNode(bx, by);
-    const pad = dijkstra(na, nb);
-    if (!pad) { setStatus(`Geen pad van ${a} naar ${b}.`, 'fout'); return; }
+  // Bereken route segment voor segment, maar start elk segment
+  // vanuit het DICHTSTBIJZIJNDE punt van het vorige segment bij het volgende entry point
+  const depotNode = nearestNode(...ep['depot']);
+  let vorigeNode = depotNode;
+
+  for (let i = 1; i < volgorde.length; i++) {
+    const stop = volgorde[i];
+    const doelNode = stop === 'depot' ? depotNode : stopNodes[stop];
+    const pad = dijkstra(vorigeNode, doelNode);
+    if (!pad) { setStatus(`Geen pad naar ${stop}.`, 'fout'); return; }
     allePixels.push(...(allePixels.length ? pad.slice(1) : pad));
+    vorigeNode = doelNode;
   }
 
   huidigePixels = allePixels;
   huidigeVolgorde = volgorde;
   herteken();
-  setStatus(`Route berekend — ${stops.length} stop${stops.length !== 1 ? 's' : ''}, optimale volgorde.`, 'ok');
+  setStatus(`Route berekend — ${stops.length} stop${stops.length !== 1 ? 's' : ''}.`, 'ok');
   toonStops(volgorde);
 }
 
@@ -330,8 +298,9 @@ function herteken() {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  // Route lijn in rood
   const pts = huidigePixels.map(p => p.split('|').map(Number));
+
+  // Rode lijn
   ctx.beginPath();
   ctx.moveTo(pts[0][0], pts[0][1]);
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
@@ -343,14 +312,14 @@ function herteken() {
 
   // Pijlen op vaste intervallen
   const pijlInterval = 120;
-  ctx.fillStyle = 'rgba(210, 30, 30, 0.9)';
+  ctx.fillStyle = 'rgba(180, 20, 20, 0.95)';
   for (let i = pijlInterval; i < pts.length - 1; i += pijlInterval) {
-    const [x1, y1] = pts[i - 3] || pts[0];
-    const [x2, y2] = pts[i];
-    const angle = Math.atan2(y2 - y1, x2 - x1);
-    const size = 18;
+    const ref = pts[Math.max(0, i-5)];
+    const cur = pts[i];
+    const angle = Math.atan2(cur[1] - ref[1], cur[0] - ref[0]);
+    const size = 20;
     ctx.save();
-    ctx.translate(x2, y2);
+    ctx.translate(cur[0], cur[1]);
     ctx.rotate(angle);
     ctx.beginPath();
     ctx.moveTo(size, 0);
@@ -361,12 +330,11 @@ function herteken() {
     ctx.restore();
   }
 
-  // Stops — grote rondjes met tuinnummer
+  // Stops met tuinnummer
   const ep = routeData.entry_points;
   huidigeVolgorde.forEach((stop, i) => {
     if (stop === 'depot') return;
     const [x, y] = ep[stop];
-    const label = stop; // tuinnummer
     const r = 32;
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
@@ -376,11 +344,11 @@ function herteken() {
     ctx.lineWidth = 5;
     ctx.stroke();
     ctx.fillStyle = '#d21e1e';
-    const fontSize = label.length <= 3 ? 26 : 20;
+    const fontSize = stop.length <= 3 ? 26 : 20;
     ctx.font = `bold ${fontSize}px system-ui`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(label, x, y);
+    ctx.fillText(stop, x, y);
   });
 
   // Depot
@@ -390,7 +358,7 @@ function herteken() {
   ctx.fillStyle = '#1a3d1a';
   ctx.fill();
   ctx.fillStyle = 'white';
-  ctx.font = 'bold 20px system-ui';
+  ctx.font = 'bold 18px system-ui';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText('START', dx, dy);
