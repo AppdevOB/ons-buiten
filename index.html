@@ -113,7 +113,9 @@ function nearestNode(cx, cy) {
   return best;
 }
 
-function dijkstra(startKey, endKey) {
+function dijkstra(startKey, endKey, forbiddenReturn) {
+  // forbiddenReturn: node die we net hebben verlaten (U-turn penalty)
+  const UTURN_PENALTY = 50000;
   const dist = new Map();
   const prev = new Map();
   const visited = new Set();
@@ -127,7 +129,9 @@ function dijkstra(startKey, endKey) {
     visited.add(u);
     if (u === endKey) break;
     for (const {node: v, w} of (graph.get(u) || [])) {
-      const nd = d + w;
+      // U-turn penalty: terugrijden naar waar we net vandaan kwamen is duur
+      const penalty = (u === startKey && v === forbiddenReturn) ? UTURN_PENALTY : 0;
+      const nd = d + w + penalty;
       if (!dist.has(v) || nd < dist.get(v)) {
         dist.set(v, nd);
         prev.set(v, u);
@@ -271,13 +275,15 @@ function tekenRoute(stops, stopNodes) {
   // vanuit het DICHTSTBIJZIJNDE punt van het vorige segment bij het volgende entry point
   const depotNode = nearestNode(...ep['depot']);
   let vorigeNode = depotNode;
+  let vorigeVorigeNode = null; // voor U-turn penalty
 
   for (let i = 1; i < volgorde.length; i++) {
     const stop = volgorde[i];
     const doelNode = stop === 'depot' ? depotNode : stopNodes[stop];
-    const pad = dijkstra(vorigeNode, doelNode);
+    const pad = dijkstra(vorigeNode, doelNode, vorigeVorigeNode);
     if (!pad) { setStatus(`Geen pad naar ${stop}.`, 'fout'); return; }
     allePixels.push(...(allePixels.length ? pad.slice(1) : pad));
+    vorigeVorigeNode = pad.length >= 2 ? pad[pad.length - 2] : vorigeNode;
     vorigeNode = doelNode;
   }
 
